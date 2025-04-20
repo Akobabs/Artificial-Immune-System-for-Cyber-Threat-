@@ -1,0 +1,710 @@
+import numpy as np
+from preprocess import load_kdd_data, load_iotnid_data, apply_pca
+from sklearn.metrics import accuracy_score, precision_score, recall_score
+import pickle
+
+def generate_detectors(self_data, num_detectors, threshold):
+    """
+    Generate detectors that do not match self (normal) data.
+    
+    Args:
+        self_data (np.array): Normal data (self).
+        num_detectors (int): Number of detectors to generate.
+        threshold (float): Matching threshold for self/non-self.
+    
+    Returns:
+        np.array: Array of detectors.
+    """
+    detectors = []
+    for i in range(num_detectors):
+        detector = np.random.rand(self_data.shape[1])  # Random detector in [0,1]
+        matches_self = False
+        for self_sample in self_data:
+            distance = np.linalg.norm(detector - self_sample)
+            if distance < threshold:
+                matches_self = True
+                break
+        if not matches_self:
+            detectors.append(detector)
+        if (i + 1) % 100 == 0:
+            print(f"Generated {i + 1}/{num_detectors} detectors...")
+    return np.array(detectors)
+
+def clonal_selection(detectors, anomaly_data, affinity_threshold, clone_rate, mutation_rate, max_detectors):
+    """
+    Refine detectors using Clonal Selection Algorithm.
+    
+    Args:
+        detectors (np.array): Initial detectors.
+        anomaly_data (np.array): Attack data to match.
+        affinity_threshold (float): Threshold for detector-anomaly match.
+        clone_rate (float): Number of clones per matched detector.
+        mutation_rate (float): Mutation scale for clones.
+        max_detectors (int): Maximum detectors to keep.
+    
+    Returns:
+        np.array: Refined detectors.
+    """
+    new_detectors = detectors.copy()
+    for sample in anomaly_data:
+        for detector in new_detectors:
+            affinity = np.linalg.norm(sample - detector)
+            if affinity < affinity_threshold:
+                # Clone
+                num_clones = int(clone_rate * (1 / (affinity + 1e-10)))
+                for _ in range(num_clones):
+                    # Mutate
+                    mutated_detector = detector + np.random.normal(0, mutation_rate, detector.shape)
+                    mutated_detector = np.clip(mutated_detector, 0, 1)  # Keep in [0,1]
+                    new_detectors = np.vstack([new_detectors, mutated_detector])
+    
+    # Select top detectors
+    if len(new_detectors) > max_detectors:
+        affinities = [min(np.linalg.norm(anomaly_data - d, axis=1)) for d in new_detectors]
+        indices = np.argsort(affinities)[:max_detectors]
+        new_detectors = new_detectors[indices]
+    
+    return new_detectors
+
+def detect_anomalies(data, detectors, threshold):
+    """
+    Detect anomalies using detectors.
+    
+    Args:
+        data (np.array): Test data to classify.
+        detectors (np.array): Array of detectors.
+        threshold (float): Matching threshold.
+    
+    Returns:
+        list: Predictions (1 for anomaly, 0 for normal).
+    """
+    predictions = []
+    for i, sample in enumerate(data):
+        is_anomaly = False
+        for detector in detectors:
+            if np.linalg.norm(sample - detector) < threshold:
+                is_anomaly = True
+                break
+        predictions.append(1 if is_anomaly else 0)
+        if (i + 1) % 100 == 0:
+            print(f"Processed {i + 1}/{len(data)} samples...")
+    return predictions
+
+def evaluate_predictions(true_labels, predictions):
+    """
+    Compute evaluation metrics.
+    
+    Args:
+        true_labels (list): True labels (1 for anomaly, 0 for normal).
+        predictions (list): Predicted labels.
+    
+    Returns:
+        dict: Accuracy, precision, recall, FPR.
+    """
+    accuracy = accuracy_score(true_labels, predictions)
+    precision = precision_score(true_labels, predictions, zero_division=0)
+    recall = recall_score(true_labels, predictions, zero_division=0)
+    fpr = np.sum((np.array(predictions) == 1) & (np.array(true_labels) == 0)) / np.sum(np.array(true_labels) == 0) if np.sum(np.array(true_labels) == 0) > 0 else 0
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'fpr': fpr
+    }
+
+def save_detectors(detectors, filename):
+    """Save detectors to file."""
+    with open(filename, 'wb') as f:
+        pickle.dump(detectors, f)
+
+if __name__ == "__main__":
+    # Load and preprocess KDD data
+    print("Processing KDD Cup 1999...")
+    try:
+        kdd_self, kdd_non_self = load_kdd_data('data/kddcup.data_10_percent')
+        kdd_self_reduced, pca = apply_pca(kdd_self, n_components=10)
+        kdd_non_self_reduced = pca.transform(kdd_non_self)
+        
+        # Generate detectors
+        detectors_kdd = generate_detectors(kdd_self_reduced, num_detectors=500, threshold=0.1)
+        print("KDD Detectors Generated:", len(detectors_kdd))
+        
+        # Refine with CSA
+        detectors_kdd = clonal_selection(
+            detectors_kdd, kdd_non_self_reduced[:500],  # Subset for speed
+            affinity_threshold=0.1, clone_rate=5, mutation_rate=0.01, max_detectors=500
+        )
+        print("KDD Detectors After CSA:", len(detectors_kdd))
+        save_detectors(detectors_kdd, 'data/detectors_kdd.pkl')
+        
+        # Test on mixed data
+        test_data_kdd = np.vstack([kdd_self_reduced[:100], kdd_non_self_reduced[:100]])
+        true_labels_kdd = [0] * 100 + [1] * 100
+        predictions_kdd = detect_anomalies(test_data_kdd, detectors_kdd, threshold=0.1)
+        metrics_kdd = evaluate_predictions(true_labels_kdd, predictions_kdd)
+        print("KDD Metrics:", metrics_kdd)
+    except Exception as e:
+        print("Error processing KDD:", e)
+    
+    # Load and preprocess IoTNID data
+    print("\nProcessing IoTNID...")
+    try:
+        iot_self, iot_non_self = load_iotnid_data('data/IoTNID.csv')
+        iot_self_reduced, pca = apply_pca(iot_self, n_components=10)
+        iot_non_self_reduced = pca.transform(iot_non_self)
+        
+        # Generate detectors
+        detectors_iot = generate_detectors(iot_self_reduced, num_detectors=500, threshold=0.1)
+        print("IoTNID Detectors Generated:", len(detectors_iot))
+        
+        # Refine with CSA
+        detectors_iot = clonal_selection(
+            detectors_iot, iot_non_self_reduced[:500],  # Subset for speed
+            affinity_threshold=0.1, clone_rate=5, mutation_rate=0.01, max_detectors=500
+        )
+        print("IoTNID Detectors After CSA:", len(detectors_iot))
+        save_detectors(detectors_iot, 'data/detectors_iot.pkl')
+        
+        # Test on mixed data
+        n_samples = min(100, len(iot_self_reduced), len(iot_non_self_reduced))
+        test_data_iot = np.vstack([iot_self_reduced[:n_samples], iot_non_self_reduced[:n_samples]])
+        true_labels_iot = [0] * n_samples + [1] * n_samples
+        predictions_iot = detect_anomalies(test_data_iot, detectors_iot, threshold=0.1)
+        metrics_iot = evaluate_predictions(true_labels_iot, predictions_iot)
+        print("IoTNID Metrics:", metrics_iot)
+    except Exception as e:
+        print("Error processing IoTNID:", e)
+
+
+STAGE 1 ABOVE 
+
+
+
+import numpy as np
+from preprocess import load_kdd_data, load_iotnid_data, apply_pca
+from sklearn.metrics import accuracy_score, precision_score, recall_score
+import pickle
+
+def generate_detectors(self_data, num_detectors, threshold):
+    detectors = []
+    for i in range(num_detectors):
+        detector = np.random.rand(self_data.shape[1])
+        matches_self = False
+        for self_sample in self_data:
+            distance = np.linalg.norm(detector - self_sample)
+            if distance < threshold:
+                matches_self = True
+                break
+        if not matches_self:
+            detectors.append(detector)
+        if (i + 1) % 100 == 0:
+            print(f"Generated {i + 1}/{num_detectors} detectors...")
+    return np.array(detectors)
+
+def clonal_selection(detectors, anomaly_data, affinity_threshold, clone_rate, mutation_rate, max_detectors):
+    new_detectors = detectors.copy()
+    for sample in anomaly_data:
+        for detector in new_detectors:
+            affinity = np.linalg.norm(sample - detector)
+            if affinity < affinity_threshold:
+                num_clones = int(clone_rate * (1 / (affinity + 1e-10)))
+                for _ in range(num_clones):
+                    mutated_detector = detector + np.random.normal(0, mutation_rate, detector.shape)
+                    mutated_detector = np.clip(mutated_detector, 0, 1)
+                    new_detectors = np.vstack([new_detectors, mutated_detector])
+    
+    if len(new_detectors) > max_detectors:
+        affinities = [min(np.linalg.norm(anomaly_data - d, axis=1)) for d in new_detectors]
+        indices = np.argsort(affinities)[:max_detectors]
+        new_detectors = new_detectors[indices]
+    
+    return new_detectors
+
+def detect_anomalies(data, detectors, threshold):
+    predictions = []
+    distances = []  # Track distances for debugging
+    for i, sample in enumerate(data):
+        min_distance = float('inf')
+        for detector in detectors:
+            distance = np.linalg.norm(sample - detector)
+            min_distance = min(min_distance, distance)
+            if distance < threshold:
+                predictions.append(1)
+                break
+        else:
+            predictions.append(0)
+        distances.append(min_distance)
+        if (i + 1) % 100 == 0:
+            print(f"Processed {i + 1}/{len(data)} samples...")
+    return predictions, distances
+
+def evaluate_predictions(true_labels, predictions):
+    accuracy = accuracy_score(true_labels, predictions)
+    precision = precision_score(true_labels, predictions, zero_division=0)
+    recall = recall_score(true_labels, predictions, zero_division=0)
+    fpr = np.sum((np.array(predictions) == 1) & (np.array(true_labels) == 0)) / np.sum(np.array(true_labels) == 0) if np.sum(np.array(true_labels) == 0) > 0 else 0
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'fpr': fpr
+    }
+
+def save_detectors(detectors, filename):
+    with open(filename, 'wb') as f:
+        pickle.dump(detectors, f)
+
+if __name__ == "__main__":
+    # Thresholds to test
+    thresholds = [0.1, 0.5, 1.0, 2.0]
+
+    # Load and preprocess KDD data
+    print("Processing KDD Cup 1999...")
+    try:
+        kdd_self, kdd_non_self = load_kdd_data('data/kddcup.data_10_percent')
+        kdd_self_reduced, pca = apply_pca(kdd_self, n_components=10)
+        kdd_non_self_reduced = pca.transform(kdd_non_self)
+        
+        # Generate detectors
+        detectors_kdd = generate_detectors(kdd_self_reduced, num_detectors=500, threshold=0.5)
+        print("KDD Detectors Generated:", len(detectors_kdd))
+        
+        # Refine with CSA
+        detectors_kdd = clonal_selection(
+            detectors_kdd, kdd_non_self_reduced[:500],
+            affinity_threshold=0.5, clone_rate=10, mutation_rate=0.05, max_detectors=500
+        )
+        print("KDD Detectors After CSA:", len(detectors_kdd))
+        save_detectors(detectors_kdd, 'data/detectors_kdd.pkl')
+        
+        # Test with different thresholds
+        test_data_kdd = np.vstack([kdd_self_reduced[:200], kdd_non_self_reduced[:200]])
+        true_labels_kdd = [0] * 200 + [1] * 200
+        for threshold in thresholds:
+            print(f"\nTesting KDD with threshold {threshold}...")
+            predictions_kdd, distances_kdd = detect_anomalies(test_data_kdd, detectors_kdd, threshold)
+            metrics_kdd = evaluate_predictions(true_labels_kdd, predictions_kdd)
+            print("KDD Metrics:", metrics_kdd)
+            print("Average Distance to Nearest Detector:", np.mean(distances_kdd))
+    except Exception as e:
+        print("Error processing KDD:", e)
+    
+    # Load and preprocess IoTNID data
+    print("\nProcessing IoTNID...")
+    try:
+        iot_self, iot_non_self = load_iotnid_data('data/IoTNID.csv')
+        iot_self_reduced, pca = apply_pca(iot_self, n_components=10)
+        iot_non_self_reduced = pca.transform(iot_non_self)
+        
+        # Generate detectors
+        detectors_iot = generate_detectors(iot_self_reduced, num_detectors=500, threshold=0.5)
+        print("IoTNID Detectors Generated:", len(detectors_iot))
+        
+        # Refine with CSA
+        detectors_iot = clonal_selection(
+            detectors_iot, iot_non_self_reduced[:500],
+            affinity_threshold=0.5, clone_rate=10, mutation_rate=0.05, max_detectors=500
+        )
+        print("IoTNID Detectors After CSA:", len(detectors_iot))
+        save_detectors(detectors_iot, 'data/detectors_iot.pkl')
+        
+        # Test with different thresholds
+        test_data_iot = np.vstack([iot_self_reduced[:200], iot_non_self_reduced[:200]])
+        true_labels_iot = [0] * 200 + [1] * 200
+        for threshold in thresholds:
+            print(f"\nTesting IoTNID with threshold {threshold}...")
+            predictions_iot, distances_iot = detect_anomalies(test_data_iot, detectors_iot, threshold)
+            metrics_iot = evaluate_predictions(true_labels_iot, predictions_iot)
+            print("IoTNID Metrics:", metrics_iot)
+            print("Average Distance to Nearest Detector:", np.mean(distances_iot))
+    except Exception as e:
+        print("Error processing IoTNID:", e)
+
+
+STAGE TWO
+
+
+import numpy as np
+from preprocess import load_kdd_data, load_iotnid_data, apply_pca
+from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.preprocessing import MinMaxScaler
+import pickle
+
+def generate_detectors(self_data, num_detectors, threshold, data_min, data_max):
+    """
+    Generate detectors that do not match self (normal) data.
+    
+    Args:
+        self_data (np.array): Normal data (self).
+        num_detectors (int): Number of detectors to generate.
+        threshold (float): Matching threshold for self/non-self.
+        data_min (np.array): Min values of data for each feature.
+        data_max (np.array): Max values of data for each feature.
+    
+    Returns:
+        np.array: Array of detectors.
+    """
+    detectors = []
+    for i in range(num_detectors):
+        # Generate detector within the data range
+        detector = np.random.uniform(data_min, data_max)
+        matches_self = False
+        for self_sample in self_data:
+            distance = np.linalg.norm(detector - self_sample)
+            if distance < threshold:
+                matches_self = True
+                break
+        if not matches_self:
+            detectors.append(detector)
+        if (i + 1) % 100 == 0:
+            print(f"Generated {i + 1}/{num_detectors} detectors...")
+    return np.array(detectors)
+
+def clonal_selection(detectors, anomaly_data, affinity_threshold, clone_rate, mutation_rate, max_detectors, data_min, data_max):
+    new_detectors = detectors.copy()
+    for sample in anomaly_data:
+        for detector in new_detectors:
+            affinity = np.linalg.norm(sample - detector)
+            if affinity < affinity_threshold:
+                num_clones = int(clone_rate * (1 / (affinity + 1e-10)))
+                for _ in range(num_clones):
+                    mutated_detector = detector + np.random.normal(0, mutation_rate, detector.shape)
+                    mutated_detector = np.clip(mutated_detector, data_min, data_max)
+                    new_detectors = np.vstack([new_detectors, mutated_detector])
+    
+    if len(new_detectors) > max_detectors:
+        affinities = [min(np.linalg.norm(anomaly_data - d, axis=1)) for d in new_detectors]
+        indices = np.argsort(affinities)[:max_detectors]
+        new_detectors = new_detectors[indices]
+    
+    return new_detectors
+
+def detect_anomalies(data, detectors, threshold):
+    predictions = []
+    distances = []
+    for i, sample in enumerate(data):
+        min_distance = float('inf')
+        for detector in detectors:
+            distance = np.linalg.norm(sample - detector)
+            min_distance = min(min_distance, distance)
+            if distance < threshold:
+                predictions.append(1)
+                break
+        else:
+            predictions.append(0)
+        distances.append(min_distance)
+        if (i + 1) % 100 == 0:
+            print(f"Processed {i + 1}/{len(data)} samples...")
+    return predictions, distances
+
+def evaluate_predictions(true_labels, predictions):
+    accuracy = accuracy_score(true_labels, predictions)
+    precision = precision_score(true_labels, predictions, zero_division=0)
+    recall = recall_score(true_labels, predictions, zero_division=0)
+    fpr = np.sum((np.array(predictions) == 1) & (np.array(true_labels) == 0)) / np.sum(np.array(true_labels) == 0) if np.sum(np.array(true_labels) == 0) > 0 else 0
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'fpr': fpr
+    }
+
+def save_detectors(detectors, filename):
+    with open(filename, 'wb') as f:
+        pickle.dump(detectors, f)
+
+if __name__ == "__main__":
+    # Load and preprocess KDD data
+    print("Processing KDD Cup 1999...")
+    try:
+        kdd_self, kdd_non_self = load_kdd_data('data/kddcup.data_10_percent')
+        kdd_self_reduced, pca = apply_pca(kdd_self, n_components=10)
+        kdd_non_self_reduced = pca.transform(kdd_non_self)
+        
+        # Normalize PCA output to [0,1]
+        scaler = MinMaxScaler()
+        kdd_all_reduced = np.vstack([kdd_self_reduced, kdd_non_self_reduced])
+        kdd_all_scaled = scaler.fit_transform(kdd_all_reduced)
+        kdd_self_scaled = kdd_all_scaled[:len(kdd_self_reduced)]
+        kdd_non_self_scaled = kdd_all_scaled[len(kdd_self_reduced):]
+        data_min, data_max = kdd_all_scaled.min(axis=0), kdd_all_scaled.max(axis=0)
+        
+        # Generate detectors
+        detectors_kdd = generate_detectors(kdd_self_scaled, num_detectors=500, threshold=0.1, data_min=data_min, data_max=data_max)
+        print("KDD Detectors Generated:", len(detectors_kdd))
+        
+        # Refine with CSA
+        detectors_kdd = clonal_selection(
+            detectors_kdd, kdd_non_self_scaled[:500],
+            affinity_threshold=0.1, clone_rate=10, mutation_rate=0.05, max_detectors=500,
+            data_min=data_min, data_max=data_max
+        )
+        print("KDD Detectors After CSA:", len(detectors_kdd))
+        save_detectors(detectors_kdd, 'data/detectors_kdd.pkl')
+        
+        # Test with different thresholds
+        thresholds = [0.1, 0.2, 0.3, 0.5]
+        test_data_kdd = np.vstack([kdd_self_scaled[:200], kdd_non_self_scaled[:200]])
+        true_labels_kdd = [0] * 200 + [1] * 200
+        for threshold in thresholds:
+            print(f"\nTesting KDD with threshold {threshold}...")
+            predictions_kdd, distances_kdd = detect_anomalies(test_data_kdd, detectors_kdd, threshold)
+            metrics_kdd = evaluate_predictions(true_labels_kdd, predictions_kdd)
+            print("KDD Metrics:", metrics_kdd)
+            print("Average Distance to Nearest Detector:", np.mean(distances_kdd))
+    except Exception as e:
+        print("Error processing KDD:", e)
+    
+    # Load and preprocess IoTNID data
+    print("\nProcessing IoTNID...")
+    try:
+        iot_self, iot_non_self = load_iotnid_data('data/IoTNID.csv')
+        iot_self_reduced, pca = apply_pca(iot_self, n_components=10)
+        iot_non_self_reduced = pca.transform(iot_non_self)
+        
+        # Normalize PCA output to [0,1]
+        scaler = MinMaxScaler()
+        iot_all_reduced = np.vstack([iot_self_reduced, iot_non_self_reduced])
+        iot_all_scaled = scaler.fit_transform(iot_all_reduced)
+        iot_self_scaled = iot_all_scaled[:len(iot_self_reduced)]
+        iot_non_self_scaled = iot_all_scaled[len(iot_self_reduced):]
+        data_min, data_max = iot_all_scaled.min(axis=0), iot_all_scaled.max(axis=0)
+        
+        # Generate detectors
+        detectors_iot = generate_detectors(iot_self_scaled, num_detectors=500, threshold=0.1, data_min=data_min, data_max=data_max)
+        print("IoTNID Detectors Generated:", len(detectors_iot))
+        
+        # Refine with CSA
+        detectors_iot = clonal_selection(
+            detectors_iot, iot_non_self_scaled[:500],
+            affinity_threshold=0.1, clone_rate=10, mutation_rate=0.05, max_detectors=500,
+            data_min=data_min, data_max=data_max
+        )
+        print("IoTNID Detectors After CSA:", len(detectors_iot))
+        save_detectors(detectors_iot, 'data/detectors_iot.pkl')
+        
+        # Test with different thresholds
+        test_data_iot = np.vstack([iot_self_scaled[:200], iot_non_self_scaled[:200]])
+        true_labels_iot = [0] * 200 + [1] * 200
+        for threshold in thresholds:
+            print(f"\nTesting IoTNID with threshold {threshold}...")
+            predictions_iot, distances_iot = detect_anomalies(test_data_iot, detectors_iot, threshold)
+            metrics_iot = evaluate_predictions(true_labels_iot, predictions_iot)
+            print("IoTNID Metrics:", metrics_iot)
+            print("Average Distance to Nearest Detector:", np.mean(distances_iot))
+    except Exception as e:
+        print("Error processing IoTNID:", e)
+
+
+STAGE THREE WITH THRESHOLD MANIPULATION
+
+
+import numpy as np
+from preprocess import load_kdd_data, load_iotnid_data, apply_pca
+from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.preprocessing import MinMaxScaler
+import pickle
+
+def generate_detectors(self_data, num_detectors, threshold, data_min, data_max):
+    detectors = []
+    for i in range(num_detectors):
+        detector = np.random.uniform(data_min, data_max)
+        matches_self = False
+        for self_sample in self_data:
+            distance = np.linalg.norm(detector - self_sample)
+            if distance < threshold:
+                matches_self = True
+                break
+        if not matches_self:
+            detectors.append(detector)
+        if (i + 1) % 100 == 0:
+            print(f"Generated {i + 1}/{num_detectors} detectors...")
+    return np.array(detectors)
+
+def clonal_selection(detectors, anomaly_data, affinity_threshold, clone_rate, mutation_rate, max_detectors, data_min, data_max):
+    new_detectors = detectors.copy()
+    for sample in anomaly_data:
+        for detector in new_detectors:
+            affinity = np.linalg.norm(sample - detector)
+            if affinity < affinity_threshold:
+                num_clones = int(clone_rate * (1 / (affinity + 1e-10)))
+                for _ in range(num_clones):
+                    mutated_detector = detector + np.random.normal(0, mutation_rate, detector.shape)
+                    mutated_detector = np.clip(mutated_detector, data_min, data_max)
+                    new_detectors = np.vstack([new_detectors, mutated_detector])
+    
+    if len(new_detectors) > max_detectors:
+        affinities = [min(np.linalg.norm(anomaly_data - d, axis=1)) for d in new_detectors]
+        indices = np.argsort(affinities)[:max_detectors]
+        new_detectors = new_detectors[indices]
+    
+    return new_detectors
+
+def artificial_immune_network(detectors, suppression_threshold, stimulation_factor, max_detectors):
+    """
+    Apply Artificial Immune Network to refine detectors.
+    
+    Args:
+        detectors (np.array): Detectors to refine.
+        suppression_threshold (float): Distance threshold for suppression.
+        stimulation_factor (float): Factor for stimulating effective detectors.
+        max_detectors (int): Maximum number of detectors to keep.
+    
+    Returns:
+        np.array: Refined detectors.
+    """
+    network = detectors.copy()
+    for i, d1 in enumerate(network):
+        for j, d2 in enumerate(network[i+1:], start=i+1):
+            distance = np.linalg.norm(d1 - d2)
+            if distance < suppression_threshold:
+                # Suppress weaker detector
+                network[j] *= (1 - stimulation_factor)
+            else:
+                # Stimulate
+                network[i] += stimulation_factor * (d2 - d1)
+    
+    # Select top detectors based on magnitude (proxy for effectiveness)
+    if len(network) > max_detectors:
+        magnitudes = np.linalg.norm(network, axis=1)
+        indices = np.argsort(magnitudes)[-max_detectors:]
+        network = network[indices]
+    
+    return network
+
+def detect_anomalies(data, detectors, threshold):
+    predictions = []
+    distances = []
+    for i, sample in enumerate(data):
+        min_distance = float('inf')
+        for detector in detectors:
+            distance = np.linalg.norm(sample - detector)
+            min_distance = min(min_distance, distance)
+            if distance < threshold:
+                predictions.append(1)
+                break
+        else:
+            predictions.append(0)
+        distances.append(min_distance)
+        if (i + 1) % 100 == 0:
+            print(f"Processed {i + 1}/{len(data)} samples...")
+    return predictions, distances
+
+def evaluate_predictions(true_labels, predictions):
+    accuracy = accuracy_score(true_labels, predictions)
+    precision = precision_score(true_labels, predictions, zero_division=0)
+    recall = recall_score(true_labels, predictions, zero_division=0)
+    fpr = np.sum((np.array(predictions) == 1) & (np.array(true_labels) == 0)) / np.sum(np.array(true_labels) == 0) if np.sum(np.array(true_labels) == 0) > 0 else 0
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'fpr': fpr
+    }
+
+def save_detectors(detectors, filename):
+    with open(filename, 'wb') as f:
+        pickle.dump(detectors, f)
+
+if __name__ == "__main__":
+    # Load and preprocess KDD data
+    print("Processing KDD Cup 1999...")
+    try:
+        kdd_self, kdd_non_self = load_kdd_data('data/kddcup.data_10_percent')
+        kdd_self_reduced, pca = apply_pca(kdd_self, n_components=10)
+        kdd_non_self_reduced = pca.transform(kdd_non_self)
+        
+        # Normalize PCA output to [0,1]
+        scaler = MinMaxScaler()
+        kdd_all_reduced = np.vstack([kdd_self_reduced, kdd_non_self_reduced])
+        kdd_all_scaled = scaler.fit_transform(kdd_all_reduced)
+        kdd_self_scaled = kdd_all_scaled[:len(kdd_self_reduced)]
+        kdd_non_self_scaled = kdd_all_scaled[len(kdd_self_reduced):]
+        data_min, data_max = kdd_all_scaled.min(axis=0), kdd_all_scaled.max(axis=0)
+        
+        # Generate detectors
+        detectors_kdd = generate_detectors(kdd_self_scaled, num_detectors=500, threshold=0.1, data_min=data_min, data_max=data_max)
+        print("KDD Detectors Generated:", len(detectors_kdd))
+        
+        # Refine with CSA
+        detectors_kdd = clonal_selection(
+            detectors_kdd, kdd_non_self_scaled[:500],
+            affinity_threshold=0.1, clone_rate=10, mutation_rate=0.1, max_detectors=500,
+            data_min=data_min, data_max=data_max
+        )
+        print("KDD Detectors After CSA:", len(detectors_kdd))
+        
+        # Refine with AIN
+        detectors_kdd = artificial_immune_network(
+            detectors_kdd, suppression_threshold=0.2, stimulation_factor=0.05, max_detectors=500
+        )
+        print("KDD Detectors After AIN:", len(detectors_kdd))
+        save_detectors(detectors_kdd, 'data/detectors_kdd.pkl')
+        
+        # Test with best threshold from previous run
+        threshold = 0.5
+        test_data_kdd = np.vstack([kdd_self_scaled[:200], kdd_non_self_scaled[:200]])
+        true_labels_kdd = [0] * 200 + [1] * 200
+        print(f"\nTesting KDD with threshold {threshold}...")
+        predictions_kdd, distances_kdd = detect_anomalies(test_data_kdd, detectors_kdd, threshold)
+        metrics_kdd = evaluate_predictions(true_labels_kdd, predictions_kdd)
+        print("KDD Metrics:", metrics_kdd)
+        print("Average Distance to Nearest Detector:", np.mean(distances_kdd))
+    except Exception as e:
+        print("Error processing KDD:", e)
+    
+    # Load and preprocess IoTNID data
+    print("\nProcessing IoTNID...")
+    try:
+        iot_self, iot_non_self = load_iotnid_data('data/IoTNID.csv')
+        iot_self_reduced, pca = apply_pca(iot_self, n_components=20)  # Increased components
+        iot_non_self_reduced = pca.transform(iot_non_self)
+        
+        # Normalize PCA output to [0,1]
+        scaler = MinMaxScaler()
+        iot_all_reduced = np.vstack([iot_self_reduced, iot_non_self_reduced])
+        iot_all_scaled = scaler.fit_transform(iot_all_reduced)
+        iot_self_scaled = iot_all_scaled[:len(iot_self_reduced)]
+        iot_non_self_scaled = iot_all_scaled[len(iot_self_reduced):]
+        data_min, data_max = iot_all_scaled.min(axis=0), iot_all_scaled.max(axis=0)
+        
+        # Balance attack data for CSA
+        np.random.seed(42)
+        indices = np.random.choice(len(iot_non_self_scaled), size=len(iot_self_scaled), replace=False)
+        balanced_non_self_scaled = iot_non_self_scaled[indices]
+        
+        # Generate detectors
+        detectors_iot = generate_detectors(iot_self_scaled, num_detectors=500, threshold=0.1, data_min=data_min, data_max=data_max)
+        print("IoTNID Detectors Generated:", len(detectors_iot))
+        
+        # Refine with CSA
+        detectors_iot = clonal_selection(
+            detectors_iot, balanced_non_self_scaled[:500],
+            affinity_threshold=0.1, clone_rate=10, mutation_rate=0.1, max_detectors=500,
+            data_min=data_min, data_max=data_max
+        )
+        print("IoTNID Detectors After CSA:", len(detectors_iot))
+        
+        # Refine with AIN
+        detectors_iot = artificial_immune_network(
+            detectors_iot, suppression_threshold=0.2, stimulation_factor=0.05, max_detectors=500
+        )
+        print("IoTNID Detectors After AIN:", len(detectors_iot))
+        save_detectors(detectors_iot, 'data/detectors_iot.pkl')
+        
+        # Test with best threshold from previous run
+        threshold = 0.5
+        test_data_iot = np.vstack([iot_self_scaled[:200], iot_non_self_scaled[:200]])
+        true_labels_iot = [0] * 200 + [1] * 200
+        print(f"\nTesting IoTNID with threshold {threshold}...")
+        predictions_iot, distances_iot = detect_anomalies(test_data_iot, detectors_iot, threshold)
+        metrics_iot = evaluate_predictions(true_labels_iot, predictions_iot)
+        print("IoTNID Metrics:", metrics_iot)
+        print("Average Distance to Nearest Detector:", np.mean(distances_iot))
+    except Exception as e:
+        print("Error processing IoTNID:", e)
+
+
+STAGE FOUR REDUCED FUNCTIONALITY
+
+
